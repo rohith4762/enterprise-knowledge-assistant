@@ -1,0 +1,14 @@
+langchain
+langchain-community
+langchain-openai
+langchain-qdrant
+langchain-classic
+langchain-text-splitters
+langchain-core
+rank_bm25
+sentence-transformers
+python-dotenv
+docx2txt
+unstructured[xlsx]
+unstructured[pptx]
+pypdf

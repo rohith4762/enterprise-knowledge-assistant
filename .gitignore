@@ -1,0 +1,23 @@
+# Environment variables / secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Data / documents (don't commit internal/sensitive docs to a public repo)
+docs/
+data/
+*.pdf
+*.docx
+*.xlsx
+*.pptx
+
+# OS
+.DS_Store
+
+# Virtual environments
+venv/
+.venv/
