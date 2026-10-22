@@ -1,156 +1,143 @@
-# Hybrid RAG Pipeline with Cross-Encoder Reranking
+# Enterprise Knowledge Assistant — Hybrid RAG
 
-A Retrieval-Augmented Generation (RAG) system that answers questions over internal
-company documents (policies, guides, technical docs) using hybrid retrieval
-(dense + sparse) and cross-encoder reranking, with source-attributed answers.
+[Project GitHub](https://github.com/rohith4762/enterprise-knowledge-assistant) · Author: Rohith Muppi
 
-## Problem
+Document-grounded question answering over TXT, PDF, DOCX, XLSX, and PPTX files, using hybrid retrieval, cross-encoder reranking, and a FastAPI service.
 
-Internal documentation is scattered across multiple formats (PDF, DOCX, XLSX, PPTX),
-and employees need fast, accurate answers with traceability back to the source
-document — not just a plausible-sounding response. This project builds a retrieval
-pipeline designed to surface the *correct* source document reliably, then generates
-an answer grounded in that source with citation metadata.
+## Problem and intended user
 
-## Architecture
+Employees and internal support teams need answers buried in policies, onboarding documents, spreadsheets, and presentations. I built this assistant to retrieve relevant evidence across those files and generate answers with source references. Example questions include “What should I do if my laptop is stolen?” and “How do I install the VPN client?”
 
-```
-Documents (PDF/DOCX/XLSX/PPTX)
-        │
-        ▼
-  Document Loader (format-specific: PyPDFLoader, Docx2txtLoader, etc.)
-        │
-        ▼
-  Recursive Chunking (1000 chars, 100 overlap)
-        │
-        ├─────────────────────┐
-        ▼                     ▼
-  Dense Retrieval        Sparse Retrieval
-  (Qdrant + OpenAI        (BM25)
-   embeddings)
-        │                     │
-        └──────────┬──────────┘
-                    ▼
-          Ensemble Retriever
-          (weighted: 0.6 BM25 / 0.4 dense)
-                    │
-                    ▼
-          Cross-Encoder Reranker
-          (ms-marco-MiniLM-L-6-v2)
-                    │
-                    ▼
-          LLM Answer Generation (GPT-4o-mini)
-          + source metadata citation
-```
+## What I implemented
 
-## Key Design Decisions
+- Format-specific document loading with source metadata retained.
+- Recursive splitting into 1,000-character chunks with 100-character overlap.
+- OpenAI `text-embedding-3-large` embeddings and in-memory Qdrant retrieval.
+- BM25 and dense retrieval, combined through weighted rank fusion.
+- Cross-encoder reranking with `cross-encoder/ms-marco-MiniLM-L-6-v2`.
+- GPT-4o-mini generation through LangChain LCEL.
+- A FastAPI wrapper with lazy initialization, health reporting, and Docker configuration.
 
-- **Hybrid retrieval (BM25 + dense) over dense-only:** BM25 catches exact keyword
-  matches (document IDs, policy names) that embedding similarity can miss; dense
-  retrieval catches semantic/paraphrased queries. Combining both via a weighted
-  ensemble (0.6 BM25 / 0.4 dense) covers both cases.
-- **Cross-encoder reranking on top of the ensemble:** the ensemble retriever
-  returns documents in top 3 reliably, but not always in the *correct order*.
-  A cross-encoder rescoring pass, which jointly encodes the query and each
-  candidate document (rather than comparing pre-computed embeddings), corrects
-  ranking errors the first-stage retrievers make.
-- **Source metadata returned with every answer:** every generated answer includes
-  the source document it was grounded in, so answers are traceable and verifiable
-  rather than opaque.
+## Architecture and design decisions
 
-## Evaluation
+| Stage | Implementation |
+| --- | --- |
+| Ingestion | Load supported files directly inside `doc_path`; retain loader metadata. |
+| Chunking | Split into 1,000-character chunks, overlapping by 100 characters. |
+| Retrieval | BM25 and Qdrant each request three chunks. Fuse rankings with weights 0.6 BM25 / 0.4 dense. |
+| Reranking | Score fused question–chunk pairs with a cross-encoder; retain three chunks. |
+| Generation | Pass question, selected content, and source paths to GPT-4o-mini at temperature 0.2. |
+| Serving | `POST /ask` initializes the pipeline on the first request and returns the answer. |
 
-Evaluated on 8 hand-labeled questions against TechNova's internal document set
-(HR policies, security guides, engineering docs, finance policy), checking whether
-the correct source document was retrieved and how it was ranked.
+BM25 helps with exact policy terms and identifiers; dense retrieval helps with paraphrases. The ensemble weights control rank fusion, rather than blending raw BM25 and cosine scores. The cross-encoder jointly scores each question and candidate chunk to reduce irrelevant context before generation.
 
-| Metric                       | Ensemble (BM25 + Dense) | + Cross-Encoder Reranking |
-|-------------------------------|:-----------------------:|:---------------------------:|
-| Hit-rate@3 (correct doc present in top 3) | 100% (8/8)   | 100% (8/8)                  |
-| Top-1 accuracy (correct doc ranked first) | 87.5% (7/8)  | **100% (8/8)**               |
+The current LCEL chain calls retrieval and reranking separately for context and metadata. A shared retrieval pass remains a future improvement. Source paths are included in the prompt; structured citation validation and reliable page, sheet, or slide references are not implemented.
 
-**Finding:** The ensemble retriever reliably surfaced the correct document within
-its top 3 results, but reranking was necessary to consistently rank it *first* —
-correcting 1 of 8 cases where an unrelated document outranked the correct source.
-Reranking also reduced irrelevant documents appearing alongside the correct one in
-several queries' top-3 results.
+## Repository layout
 
-### Example: Before vs. After Reranking
+| File | Purpose |
+| --- | --- |
+| `main.py` | FastAPI wrapper and RAG pipeline |
+| `requirements.txt` | Supplied runtime dependencies; most are unpinned |
+| `Dockerfile` | Python 3.12 container serving port 8000 |
+| `.env.example` | Local configuration template |
+| `notebook/EKA.ipynb` | Original exploratory notebook, with saved outputs cleared |
 
-**Query:** "How do I reset or rotate my password?"
+## Run locally
 
-| Rank | Before Reranking | After Reranking |
-|------|-------------------|-------------------|
-| 1 | Incident_Response_Guide.docx ❌ | Password_MFA_Policy.pdf ✅ |
-| 2 | Leave_Policy.docx (irrelevant) | Password_MFA_Policy.pdf ✅ |
-| 3 | Incident_Response_Guide.docx | Incident_Response_Guide.docx |
-
-## Example Output
-
-**Query:** "What should I do if my laptop is stolen?"
-
-> If your laptop is stolen, you should take the following steps:
-> 1. Report it immediately — notify the Security team and IT as soon as possible.
-> 2. Credential revocation — the Security team will revoke VPN and MFA credentials
->    tied to the device.
-> 3. Remote wipe — IT will initiate a remote wipe of the device if it is enrolled
->    in device management.
->
-> **Source:** Incident Response Guide (SEC-DOC-002)
-
-## Tech Stack
-
-- **Orchestration:** LangChain (LCEL chains)
-- **Dense retrieval:** Qdrant + OpenAI `text-embedding-3-large`
-- **Sparse retrieval:** BM25 (`rank_bm25`)
-- **Reranking:** `cross-encoder/ms-marco-MiniLM-L-6-v2` (Sentence Transformers)
-- **Generation:** GPT-4o-mini
-- **Document loaders:** PyPDFLoader, Docx2txtLoader, UnstructuredExcelLoader,
-  UnstructuredPowerPointLoader, TextLoader
-
-## Known Limitations
-
-- **In-memory vector store:** the Qdrant instance runs with `location=":memory:"`
-  for this demo, so the index does not persist between runs. A production
-  deployment would use a persistent or managed Qdrant instance.
-- **Small evaluation set:** the 8-question evaluation set is sufficient to compare
-  retrieval strategies directionally but is not large enough to draw statistically
-  robust conclusions. A larger labeled set (30-50+ questions) would strengthen
-  these results.
-- **No answer-faithfulness scoring yet:** evaluation currently measures whether
-  the *correct document* was retrieved, not whether the generated answer is fully
-  faithful to that document's content. This is a planned next step.
-- **OpenAI dependency:** embeddings and generation currently use OpenAI's API,
-  which introduces cost and external dependency. A future iteration could swap
-  in a local embedding model for cost/latency comparison.
-
-## Next Steps
-
-- [ ] Expand evaluation set to 30+ labeled questions
-- [ ] Add answer-faithfulness / groundedness scoring
-- [ ] Move vector store from in-memory to persistent Qdrant instance
-- [ ] Wrap pipeline in a FastAPI service for interactive querying
-- [ ] Compare OpenAI embeddings vs. a local/open-source embedding model
-
-## Setup
+Use Python 3.12. Create a virtual environment, then install the dependencies:
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+mkdir -p docs
 ```
 
-Create a `.env` file with:
+Set `OPENAI_API_KEY` in `.env`, then place your documents directly inside `docs/`. Set `doc_path` if using another directory. Do not commit credentials or private documents.
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
-OPENAI_API_KEY=your_key_here
-QDRANT_URL=your_qdrant_url        # optional, omit to use in-memory
-QDRANT_API_KEY=your_qdrant_key    # optional
+
+Interactive API documentation: <http://localhost:8000/docs>.
+
+```bash
+curl http://localhost:8000/health
+curl -X POST http://localhost:8000/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"What should I do if my laptop is stolen?"}'
 ```
 
-## Usage
+The first question loads documents, embeds the corpus, builds the in-memory index, and loads the reranker. This requires network access, OpenAI credentials, and a model download. Embedding and generation calls incur API charges. `/health` reports process status and whether initialization has completed; `status: ok` alone does not verify that a question can be answered.
 
-Place source documents (PDF/DOCX/XLSX/PPTX/TXT) in a folder and point `doc_path`
-to it, then run the notebook cells in order: load → chunk → embed → build
-retrievers → query.
+Although the code reads `QDRANT_URL` and `QDRANT_API_KEY`, the current vector-store initialization uses `location=":memory:"`. Remote Qdrant credentials are unnecessary and do not enable remote storage.
 
-## Project Status
+## Run with Docker
 
-🟢 Active — evaluation and API wrapper planned as next iterations.
+```bash
+docker build -t enterprise-knowledge-assistant .
+docker run --rm -p 8000:8000 --env-file .env \
+  -e doc_path=/app/docs \
+  -v "$PWD/docs:/app/docs:ro" \
+  enterprise-knowledge-assistant
+```
+
+Documents and `.env` files are excluded from the image. Mount documents at runtime as shown above.
+
+## Run the notebook
+
+Install JupyterLab separately and run the cells in order:
+
+```bash
+python -m pip install jupyterlab
+jupyter lab notebook/EKA.ipynb
+```
+
+The notebook contains exploratory inspection and installation cells. Use the API instructions for the service entry point. The original source corpus is not included, so answers depend on the documents you provide.
+
+## Baseline versus improved retrieval
+
+The supplied project PDF reports a **synthetic demonstration benchmark** of 100 questions across three variants, totaling 300 requests. These are historical reported results, not measurements reproduced by this repository update.
+
+| Metric | Dense baseline | Hybrid | Hybrid + demo reranker |
+| --- | ---: | ---: | ---: |
+| Completed requests | 100/100 | 100/100 | 100/100 |
+| Recall@3 | 90.00% | 93.33% | 94.44% |
+| Precision@3 | 31.48% | 33.33% | 33.70% |
+| MRR | 0.7444 | 0.8630 | 0.9074 |
+
+The reported dense-to-final improvement is 4.44 percentage points in Recall@3 and 0.1630 in MRR.
+
+### Methodology and limits
+
+- Seven short synthetic policies; 84 single-source paraphrases, six multi-source questions, and ten unanswerable questions.
+- One repeat per variant. File-level retrieval metrics use the 90 answerable questions.
+- The final variant was labeled a **demo reranker**. These results do not establish the performance of the actual cross-encoder in `main.py`.
+- Timing and cost in the supplied report were simulated; they are not live API latency or billed usage. Answer correctness, citation support, and refusal quality were not established.
+- The benchmark corpus, labels, evaluator, and raw results were not supplied. Exact reproduction requires publishing those artifacts, including duplicate-file handling and metric definitions.
+
+The previous README's eight-question aggregate scores are not retained as verified results because the supporting evaluation artifacts are not included.
+
+## Failure examples from the documented notebook outputs
+
+These historical observations are separate from the synthetic benchmark. Notebook outputs have been cleared in the published source.
+
+| Question or issue | Observed behavior | Change or remaining work |
+| --- | --- | --- |
+| “What should I do if my laptop is stolen?” | Hybrid retrieval included unrelated leave-policy content. | Reranking removed that candidate from the top three, retaining incident-response and password/MFA evidence. |
+| “How do I reset or rotate my password?” | Unreranked candidates included leave-policy content and ranked incident-response content first. | Reranking placed two password-policy chunks first and removed leave-policy content from the top three. |
+| “What are the standard working hours?” | Reranked results still included a leave-policy chunk alongside handbook chunks. | Remaining limitation: reranking does not guarantee every selected chunk supports the answer. |
+
+## Current limitations and next steps
+
+- Qdrant is in memory; every process restart rebuilds the index. Multiple server workers initialize separate indexes.
+- Retrieval and reranking run twice per question for context and metadata.
+- No explicit evidence threshold, abstention policy, or answer-faithfulness evaluator.
+- No OCR, access control, document-update handling, or persistent indexing.
+- Repeated chunks from one document can consume context slots.
+- No token/cost telemetry, cloud deployment artifacts, or supplied service test suite. AWS ECS/Fargate deployment and previously mentioned passing-test counts are not verified by these files.
+- Most dependencies are unpinned. A tested lockfile and reproducible benchmark artifacts remain future work.
+
+Next priorities are a shared retrieval pass, passage-level relevance labels, evidence-support and unanswerable-query evaluation, and recorded live latency and token usage.
